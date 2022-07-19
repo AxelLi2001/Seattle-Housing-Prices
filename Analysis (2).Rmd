@@ -1,0 +1,183 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r, message = FALSE, warning = F}
+set.seed(484)
+library(dplyr)
+library(stringr)
+library(fastDummies)
+library(MLmetrics)
+library(glmnet)
+library(hdm)
+library(ggplot2)
+library(gam)
+```
+
+
+```{r}
+res <- read.csv("EXTR_ResBldg.csv")
+parcel <- read.csv("EXTR_Parcel.csv")
+env <- read.csv("EXTR_EnvironmentalRestriction_V.csv")
+sale <- read.csv("EXTR_RPSale.csv")
+```
+
+```{r}
+# put them together
+data_cleaned <- merge(res, env, by = c("Minor" = "Minor", "Major" = "Major"))
+data_cleaned <- merge(parcel, data_cleaned, by = c("Minor" = "Minor", "Major" = "Major"))
+data_cleaned <- merge(sale, data_cleaned, by = c("Minor" = "Minor", "Major" = "Major"))
+# make a column for year and month
+data_cleaned$DocumentDate <- as.Date(data_cleaned$DocumentDate, "%m/%d/%Y")
+data_cleaned <- data_cleaned %>% mutate(Month = format(data_cleaned$DocumentDate, "%m")) %>% mutate(Year = format(data_cleaned$DocumentDate,"%Y"))
+# do not want empty type
+data_cleaned <- data_cleaned %>% filter(Type != "")
+```
+
+```{r}
+data_selected <- data_cleaned %>% dplyr::select(SalePrice, DistrictName, Type, SqFtTotLiving, SqFtLot, SqFtTotBasement, SqFtOpenPorch, SqFtEnclosedPorch, SqFtDeck, SqFtGarageAttached, PcntUnusable, Month, Year, BrickStone, HeatSystem, Condition, WaterSystem, SewerSystem, TrafficNoise,  PowerLines, OtherNuisances, HistoricSite, NbrLivingUnits, BathFullCount)
+# We don't want potentially poorly recorded prices(tends out this is really important)
+data_selected <- data_selected %>% filter(SalePrice > 10000)
+# we are not using all records
+data_selected <- data_selected %>% filter(Year > 2019)
+
+
+# make dummy variables
+data_selected <- dummy_cols(data_selected, select_columns = c("DistrictName", "Type", "Month", "Year"))
+data_selected$HeatSystem <- as.factor(data_selected$HeatSystem)
+data_selected$Condition <- as.factor(data_selected$Condition)
+data_selected$WaterSystem <- as.factor(data_selected$WaterSystem)
+data_selected$SewerSystem <- as.factor(data_selected$SewerSystem)
+data_selected$TrafficNoise <- as.factor(data_selected$TrafficNoise)
+data_selected$PowerLines <- as.factor(data_selected$PowerLines)
+data_selected$OtherNuisances <- as.factor(data_selected$OtherNuisances)
+data_selected$HistoricSite <- as.factor(data_selected$HistoricSite)
+# train test split
+train <- data_selected %>% filter(Year < 2022)
+test <- data_selected[data_selected$Year == 2022,]
+# take out the above non-dummy columns
+col_dont_want <- c("DistrictName", "Type", "Month", "Year")
+train <- train[, ! names(train) %in% col_dont_want]
+test <- test[, ! names(test) %in% col_dont_want]
+```
+
+```{r}
+m1 <- lm(SalePrice ~ ., data = train)
+summary(m1)
+m1_pred <- predict(m1, test[,-1])
+MSEm1 <- MSE(m1_pred, test$SalePrice)
+MSEm1
+```
+
+```{r}
+x <- scale(data.matrix(train[,-1]))
+y <- train$SalePrice
+
+cv_model <- cv.glmnet(x, y, alpha = 1)
+
+best_lambda <- cv_model$lambda.min
+
+best_lasso <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+
+as.table(as.matrix(best_lasso$beta))
+```
+
+```{r}
+train %>% filter(Year_2020 == 1) %>% 
+  ggplot(aes(y = log(SalePrice))) +
+  geom_boxplot() + 
+  labs(title = "Log(SalePrice) of Residential Houses in 2020")
+train %>% filter(Year_2021 == 1) %>% 
+  ggplot(aes(y = log(SalePrice))) +
+  geom_boxplot() +
+  labs(title = "Log(SalePrice) of Residential Houses in 2021")
+```
+
+```{r}
+# lasso prediction
+x2 <- scale(data.matrix(test[,-1]))
+y2 <- test$SalePrice
+x2[is.na(x2)] <- 0
+lasso_pred <- predict(best_lasso, x2)
+MSELasso <- MSE(lasso_pred, y2)
+MSELasso
+```
+
+```{r}
+# GAM
+gam1 <- gam(SalePrice ~ s(SqFtTotLiving,3) + s(SqFtLot,3) + s(SqFtTotBasement,3) + s(SqFtOpenPorch,3) + s(SqFtEnclosedPorch,3) + s(SqFtDeck,3) + s(SqFtGarageAttached,3) + s(PcntUnusable,3), data = train)
+plot(gam1, col = "red", se = T)
+```
+
+```{r}
+# lm taking account of lasso results and GAM plots
+m2 <- lm(SalePrice ~ . - Type_Wetland - Month_12 - Month_07 - Year_2021 - Type_SeismicHazard - DistrictName_KENMORE - DistrictName_BURIEN - SqFtTotBasement + SqFtLot^2, data = train)
+summary(m2)
+m2_pred <- predict(m2, test[,-1])
+MSEm2 <- MSE(m2_pred, test$SalePrice)
+MSEm2
+```
+
+```{r}
+# SqFtTotLiving is important?
+m3 <- lm(SalePrice ~ SqFtTotLiving, data = train)
+summary(m3)$adj.r.squared
+m4 <- lm(SalePrice ~ SqFtLot, data = train)
+summary(m4)$adj.r.squared
+```
+```{r}
+# double lasso
+fm <- as.formula(~ . - SalePrice - 1 + SqFtTotLiving * (.))
+X <- model.matrix(fm, data = train[train$Year_2020 == 1,])
+Y <- train[train$Year_2020 == 1,]$SalePrice
+# only want SqFtTotLiving related variables
+index.liv <- grep("SqFtTotLiving", colnames(X))
+reg.out<-lm(Y~X)
+#coefficients for SqFtTotLiving&interactions
+index.liv.regout<-grep("SqFtTotLiving",names(reg.out$coefficients))
+
+# Partialling out
+# double lasso regress Y on X with the columns in index.liv as focal
+effects.liv.ds <- rlassoEffects(x = X, y = Y, method = "double selection",index = index.liv)
+summary(effects.liv.ds)
+```
+
+
+```{r}
+# double lasso
+fm <- as.formula(~ . - SalePrice - 1)
+X <- model.matrix(fm, data = train[train$Year_2021 == 1,])
+Y <- train[train$Year_2021 == 1,]$SalePrice
+# only want SqFtTotLiving related variables
+index.liv <- grep("SqFtTotLiving", colnames(X))
+reg.out<-lm(Y~X)
+#coefficients for SqFtTotLiving&interactions
+index.liv.regout<-grep("SqFtTotLiving",names(reg.out$coefficients))
+
+# Partialling out
+# double lasso regress Y on X with the columns in index.liv as focal
+effects.liv.ds <- rlassoEffects(x = X, y = Y, method = "double selection",index = index.liv)
+summary(effects.liv.ds)
+```
+
+
+```{r}
+# double lasso
+fm <- as.formula(~ . - SalePrice - 1)
+X <- model.matrix(fm, data = test)
+Y <- test$SalePrice
+# only want SqFtTotLiving related variables
+index.liv <- grep("SqFtTotLiving", colnames(X))
+reg.out<-lm(Y~X)
+#coefficients for SqFtTotLiving&interactions
+index.liv.regout<-grep("SqFtTotLiving",names(reg.out$coefficients))
+
+# Partialling out
+# double lasso regress Y on X with the columns in index.liv as focal
+effects.liv.ds <- rlassoEffects(x = X, y = Y, method = "double selection",index = index.liv)
+summary(effects.liv.ds)
+```
+```{r}
+sum(lasso_pred - test$SalePrice < 1)
+```
